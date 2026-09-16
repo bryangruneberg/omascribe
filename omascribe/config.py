@@ -5,7 +5,7 @@ import tempfile
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from .logger import get_logger
 
@@ -39,6 +39,13 @@ class AppConfig:
     # privacy-first CPU pipeline and dodges broken-CUDA-wheel crashes like
     # "no kernel image is available for execution on the device".
     whisper_device: str = "cpu"
+    # One folder per meeting, grouped by category, under this directory. Empty
+    # keeps upstream's flat notes_dir/transcripts_dir layout. recordings_dir
+    # stays the capture location either way; audio moves into the meeting
+    # folder once processed.
+    meetings_dir: str = ""
+    # Offered under the meeting title while recording; each is a folder name.
+    categories: list = field(default_factory=list)
     notes_dir: str = "notes"
     recordings_dir: str = "recordings"
     transcripts_dir: str = "transcripts"
@@ -181,13 +188,23 @@ def validate_config(config: AppConfig) -> tuple[bool, Optional[str]]:
     string_fields = (
         "ai_provider", "ai_model", "ollama_model", "transcriber", "whisper_model", "whisper_device",
         "notes_dir", "recordings_dir", "transcripts_dir", "editor", "terminal_file_browser",
-        "recording_mode", "mic_device", "system_device",
+        "recording_mode", "mic_device", "system_device", "meetings_dir",
     )
-    for field in string_fields:
-        if not isinstance(getattr(config, field), str):
-            return False, f"Invalid {field}: expected text"
+    for name in string_fields:
+        if not isinstance(getattr(config, name), str):
+            return False, f"Invalid {name}: expected text"
     if not isinstance(config.recording_retention_days, int) or isinstance(config.recording_retention_days, bool):
         return False, "Invalid recording_retention_days: expected an integer"
+
+    from .library import validate_category_name
+    if not isinstance(config.categories, list):
+        return False, "Invalid categories: expected a list"
+    for name in config.categories:
+        problem = validate_category_name(name)
+        if problem:
+            return False, f"Invalid categories: {problem}"
+    if len(set(config.categories)) != len(config.categories):
+        return False, "Invalid categories: names must be unique"
 
     # Validate AI provider
     valid_providers = ["openai", "anthropic", "openrouter", "assemblyai", "deepinfra", "local", "none"]
@@ -257,8 +274,12 @@ def validate_config(config: AppConfig) -> tuple[bool, Optional[str]]:
         return False, f"Invalid recording_mode: {config.recording_mode}. Must be one of {valid_modes}"
     
     # Validate directories exist or can be created (allow defaults to be auto-created)
+    # In the folder layout notes and transcripts live under meetings_dir, so
+    # the flat directories are unused and need not exist.
+    folder_layout = bool(config.meetings_dir)
+
     notes_path = Path(config.notes_dir).expanduser().absolute()
-    if config.notes_dir != "notes":
+    if config.notes_dir != "notes" and not folder_layout:
         # Non-default paths must already exist
         if not notes_path.exists():
             return False, f"Notes directory does not exist: {notes_path}\nPlease create it first or use a relative path like 'notes'"
@@ -274,7 +295,7 @@ def validate_config(config: AppConfig) -> tuple[bool, Optional[str]]:
             return False, f"Recordings path is not a directory: {rec_path}"
     
     transcripts_path = Path(config.transcripts_dir).expanduser().absolute()
-    if config.transcripts_dir != "transcripts":
+    if config.transcripts_dir != "transcripts" and not folder_layout:
         # Non-default paths must already exist
         if not transcripts_path.exists():
             return False, f"Transcripts directory does not exist: {transcripts_path}\nPlease create it first or use a relative path like 'transcripts'"

@@ -387,6 +387,8 @@ class JobRunner:
             title=job.title,
             user_notes=job.user_notes,
             summary_input=result.speaker_text(),
+            category=job.category,
+            recording_path=job.audio_path,
             when=job.stopped_at,
         )
         return note_path, ai_error

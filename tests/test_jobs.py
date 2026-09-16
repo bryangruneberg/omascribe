@@ -136,9 +136,10 @@ def test_success_writes_note_for_the_stop_time_and_clears_the_job(tmp_path):
     assert events["done"] == [(job.id, "/notes/x.md")]
     assert jobs.list_jobs() == []
     call = maker.calls[0]
-    assert call["title"] == "Midweek Mayhem"
+    assert call["title"] == "Midweek Mayhem" and call["category"] == "DGxC Internal"
     assert call["when"] == datetime(2026, 9, 16, 9, 4, 20)
     assert call["summary_input"] == "Speaker A: hello there"
+    assert call["recording_path"].endswith("2026-09-16-083001.wav")
 
 
 def test_transient_failure_backs_off(tmp_path):

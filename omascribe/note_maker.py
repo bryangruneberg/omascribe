@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Optional, Any
 from collections import Counter
 import re
+import shutil
+
+from . import library
 
 from .logger import get_logger
 
@@ -36,7 +39,8 @@ class NoteMaker:
         transcripts_dir: str = "transcripts",
         ai_provider: str = "none",  # "cloud", "local", or "none"
         ai_model: str = "balanced",  # For cloud: tier, for local: ollama model
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        meetings_dir: str = "",
     ):
         """
         Initialize note maker.
@@ -51,8 +55,14 @@ class NoteMaker:
         logger.info(f"Initializing NoteMaker (output_dir: {output_dir}, transcripts_dir: {transcripts_dir}, ai_provider: {ai_provider}, ai_model: {ai_model})")
         self.output_dir = Path(output_dir).expanduser()
         self.transcripts_dir = Path(transcripts_dir).expanduser()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        # Folder-per-meeting layout when set (see library.py); the flat dirs
+        # above are then only created on demand, never written to.
+        self.meetings_dir = Path(meetings_dir).expanduser() if meetings_dir else None
+        if self.meetings_dir:
+            self.meetings_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
         self.ai_provider = ai_provider
         self.summarizer: Optional[Any] = None
         
@@ -123,6 +133,8 @@ class NoteMaker:
         metadata: Optional[dict] = None,
         user_notes: str = "",
         summary_input: Optional[str] = None,
+        category: Optional[str] = None,
+        recording_path: Optional[str] = None,
         when: Optional[datetime] = None,
     ) -> tuple[str, str, Optional[str]]:
         """Create a markdown note and separate transcript file.
@@ -137,6 +149,10 @@ class NoteMaker:
             summary_input: What the summariser reads, when it should differ
                 from transcript_text (e.g. with speaker labels). Word counts
                 still come from transcript_text.
+            category: The meeting's category, or None. Picks the folder in the
+                folder layout and is given to the summariser as context.
+            recording_path: The audio file. In the folder layout it is moved
+                into the meeting folder once the note and transcript exist.
             when: The meeting's time (default now). Names the files, so
                 repeating a call for the same meeting overwrites rather than
                 duplicates -- which is what makes a retried job idempotent.
@@ -163,7 +179,9 @@ class NoteMaker:
                     logger.info("Generating AI summary with local Ollama")
                     print("Generating AI summary with local Ollama (this may take a while)...")
                     
-                ai_summary = self.summarizer.summarize(summary_input or transcript_text, user_notes=user_notes)
+                ai_summary = self.summarizer.summarize(
+                    summary_input or transcript_text, user_notes=user_notes, category=category or ""
+                )
                 summary = {
                     'word_count': len(transcript_text.split()),
                     'ai_summary': ai_summary,
@@ -182,17 +200,23 @@ class NoteMaker:
             summary = self._extract_simple_summary(transcript_text)
         
         # Generate filename base (same for both files)
-        safe_title = re.sub(r'[^\w\s-]', '', title.lower())
-        safe_title = re.sub(r'[-\s]+', '-', safe_title)
-        timestamp = now.strftime("%Y-%m-%d-%H%M%S")
-        filename_base = f"{timestamp}-{safe_title[:50]}"
+        filename_base = library.meeting_basename(now, title)
         
         # Get recording filename from metadata
         recording_file = metadata.get('recording_file', '') if metadata else ''
+
+        if self.meetings_dir:
+            meeting_dir = self.meetings_dir / library.category_dir_name(category) / filename_base
+            meeting_dir.mkdir(parents=True, exist_ok=True)
+            notes_dir, transcripts_dir = meeting_dir, meeting_dir
+            if recording_path:
+                recording_file = f"{filename_base}{Path(recording_path).suffix or '.wav'}"
+        else:
+            notes_dir, transcripts_dir = self.output_dir, self.transcripts_dir
         
         # Create transcript file (plain text)
         transcript_filename = f"{filename_base}.txt"
-        transcript_path = self.transcripts_dir / transcript_filename
+        transcript_path = transcripts_dir / transcript_filename
         transcript_content = self._generate_transcript_file(
             title=title,
             date=now,
@@ -205,7 +229,7 @@ class NoteMaker:
         
         # Create note file (markdown, summary only)
         note_filename = f"{filename_base}.md"
-        note_path = self.output_dir / note_filename
+        note_path = notes_dir / note_filename
         note_content = self._generate_note_file(
             title=title,
             date=now,
@@ -214,10 +238,17 @@ class NoteMaker:
             transcript_filename=transcript_filename,
             recording_file=recording_file,
             metadata=metadata or {},
-            user_notes=user_notes
+            user_notes=user_notes,
+            category=category,
         )
         note_path.write_text(note_content)
         logger.info(f"Note saved: {note_path}")
+
+        # Only now that note and transcript both exist does the audio leave
+        # recordings/: a failure above leaves it where a retry can find it.
+        if self.meetings_dir and recording_path and Path(recording_path).exists():
+            shutil.move(recording_path, notes_dir / recording_file)
+            logger.info(f"Recording moved: {notes_dir / recording_file}")
         
         return str(note_path), str(transcript_path), ai_error
     
@@ -296,17 +327,20 @@ Recording: {recording_file}
         transcript_filename: str,
         recording_file: str,
         metadata: dict,
-        user_notes: str = ""
+        user_notes: str = "",
+        category: Optional[str] = None,
     ) -> str:
         """Generate markdown note file (summary only, no transcript)."""
         
         duration_str = self._format_duration(duration)
         date_str = date.strftime("%B %d, %Y at %I:%M %p")
         
+        category_line = f'category: "{category}"\n' if category else ""
+
         # Build frontmatter with transcript reference
         frontmatter = f"""---
 title: "{title}"
-date: {date.strftime("%Y-%m-%d")}
+{category_line}date: {date.strftime("%Y-%m-%d")}
 time: "{date.strftime("%H:%M")}"
 duration_seconds: {int(duration)}
 word_count: {summary['word_count']}

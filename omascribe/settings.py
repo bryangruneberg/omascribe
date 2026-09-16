@@ -647,6 +647,18 @@ class SettingsScreen(Screen):
         widgets = []
         
         widgets.append(Static("📁 Directories", classes="settings-section-title"))
+
+        widgets.append(Static("Meetings Folder", classes="settings-label"))
+        widgets.append(Input(value=self.config.get("meetings_dir", ""), id="meetings-dir-input",
+                             classes="settings-input", placeholder="(empty = flat notes/transcripts dirs below)"))
+        widgets.append(Static("• One folder per meeting: <folder>/<Category>/<meeting>/ holds note, transcript and audio",
+                              classes="settings-hint"))
+        widgets.append(Static("• When set, Notes and Transcripts directories below are not used", classes="settings-hint"))
+
+        widgets.append(Static("Categories", classes="settings-label"))
+        widgets.append(Input(value=", ".join(self.config.get("categories") or []), id="categories-input",
+                             classes="settings-input", placeholder="e.g. Work, Clients, Personal"))
+        widgets.append(Static("• Comma-separated; offered under the meeting title while recording", classes="settings-hint"))
         
         widgets.append(Static("Notes Directory", classes="settings-label"))
         notes_input = Input(value=self.config["notes_dir"], id="notes-dir-input", classes="settings-input")
@@ -945,6 +957,8 @@ class SettingsScreen(Screen):
     def on_input_changed(self, event: Input.Changed) -> None:
         field = {
             "notes-dir-input": "notes_dir",
+            "meetings-dir-input": "meetings_dir",
+            "categories-input": "categories",
             "rec-dir-input": "recordings_dir",
             "trans-dir-input": "transcripts_dir",
             "editor-input": "editor",
@@ -955,12 +969,20 @@ class SettingsScreen(Screen):
             "assemblyai-key-input": "assemblyai_api_key",
             "deepinfra-key-input": "deepinfra_api_key",
         }.get(event.input.id or "")
-        if field:
+        if field == "categories":
+            self.config[field] = self._parse_categories(event.value)
+        elif field:
             self.config[field] = event.value
+
+    @staticmethod
+    def _parse_categories(text: str) -> list:
+        return [name.strip() for name in text.split(",") if name.strip()]
 
     def _capture_inputs(self) -> None:
         for widget_id, field in {
             "notes-dir-input": "notes_dir",
+            "meetings-dir-input": "meetings_dir",
+            "categories-input": "categories",
             "rec-dir-input": "recordings_dir",
             "trans-dir-input": "transcripts_dir",
             "editor-input": "editor",
@@ -972,7 +994,9 @@ class SettingsScreen(Screen):
             "deepinfra-key-input": "deepinfra_api_key",
         }.items():
             matches = self.query(f"#{widget_id}")
-            if matches:
+            if matches and field == "categories":
+                self.config[field] = self._parse_categories(matches[0].value)
+            elif matches:
                 self.config[field] = matches[0].value.strip()
     
     async def refresh_content(self) -> None:

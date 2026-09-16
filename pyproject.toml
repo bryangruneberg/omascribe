@@ -92,6 +92,7 @@ ignore = [
 omascribe = "omascribe.app:run"
 omascribe-status = "omascribe.desktop:bar_status"
 omascribe-panel = "omascribe.desktop:panel_data"
+omascribe-migrate-folders = "omascribe.library:migrate_main"
 
 [project.urls]
 Homepage = "https://github.com/jamespember/omascribe"

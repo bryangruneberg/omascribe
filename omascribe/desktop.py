@@ -190,12 +190,17 @@ def panel_data() -> int:
     else:
         status = {"state": "ready", "duration": ""}
 
+    from . import library
+
     config_obj = config.load_config()
-    notes_dir = Path(config_obj.notes_dir).expanduser().absolute()
+    if library.uses_folders(config_obj):
+        notes_dir = library.meetings_root(config_obj).absolute()
+    else:
+        notes_dir = Path(config_obj.notes_dir).expanduser().absolute()
     recent = []
     try:
         if notes_dir.is_dir():
-            candidates = sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+            candidates = library.list_notes(config_obj)[:8]
             for note in candidates:
                 try:
                     text = note.read_text(encoding="utf-8", errors="replace")
@@ -206,6 +211,7 @@ def panel_data() -> int:
                         "title": _frontmatter_value(text, "title") or note.stem,
                         "date": _frontmatter_value(text, "date"),
                         "words": _frontmatter_value(text, "word_count"),
+                        "category": library.category_of(note, config_obj) or "",
                         "path": str(note),
                     }
                 )

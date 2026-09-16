@@ -179,7 +179,7 @@ def test_note_maker_summarises_speaker_text(tmp_path):
     maker = NoteMaker(output_dir=str(tmp_path / "n"), transcripts_dir=str(tmp_path / "t"),
                       ai_provider="assemblyai", ai_model="haiku", api_key="k")
     seen = []
-    maker.summarizer = SimpleNamespace(summarize=lambda text, user_notes="": seen.append(text) or (_ for _ in ()).throw(RuntimeError("stop")))
+    maker.summarizer = SimpleNamespace(summarize=lambda text, user_notes="", category="": seen.append(text) or (_ for _ in ()).throw(RuntimeError("stop")))
     maker.create_note(transcript_text="plain words", formatted_transcript="", duration=1,
                       title="T", summary_input="Speaker A: plain words")
     assert seen == ["Speaker A: plain words"]

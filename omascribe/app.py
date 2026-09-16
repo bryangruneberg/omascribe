@@ -12,7 +12,7 @@ from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical, Horizontal, ScrollableContainer
-from textual.widgets import Static, Label, ListView, ListItem, Footer, Input, Button, TextArea, Markdown
+from textual.widgets import Static, Label, ListView, ListItem, Footer, Input, Button, TextArea, Markdown, Select
 from textual.binding import Binding
 from textual.reactive import reactive
 from textual.screen import Screen, ModalScreen
@@ -21,7 +21,7 @@ from textual import work
 from omascribe.recorder import AudioRecorder, list_active_sink_inputs
 from rich.markup import escape
 
-from omascribe import jobs
+from omascribe import jobs, library
 from omascribe.transcriber import build_transcriber, format_segments
 from omascribe.note_maker import NoteMaker
 from omascribe.config import load_config, save_config, AppConfig, validate_config
@@ -41,6 +41,10 @@ class RecordingView(Container):
     """Full-screen view shown during active recording."""
     
     elapsed_time = reactive(0)  # seconds
+
+    def __init__(self, categories: Optional[list] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.categories = list(categories or [])
     
     def compose(self) -> ComposeResult:
         """Build the recording view UI."""
@@ -88,6 +92,16 @@ class RecordingView(Container):
                     # Optional title input
                     yield Static("Meeting Title (optional):", id="title-label")
                     yield Input(placeholder="Enter meeting title...", id="meeting-title-input")
+
+                    # Category: which folder the meeting is filed in, and
+                    # context for the summary. Only shown when configured.
+                    if self.categories:
+                        yield Static("Category:", id="category-label")
+                        yield Select(
+                            [(name, name) for name in self.categories],
+                            prompt=library.UNCATEGORISED,
+                            id="meeting-category-select",
+                        )
                     
                     # User notes area
                     yield Static("Your Notes:", id="notes-label")
@@ -144,7 +158,11 @@ class RecordingView(Container):
         try:
             title_input = self.query_one("#meeting-title-input", Input)
             notes_input = self.query_one("#user-notes-input", TextArea)
-            return title_input.has_focus or notes_input.has_focus
+            # An open or focused dropdown uses letter keys to jump between
+            # options, so 's' must not stop the recording from under it.
+            category = self.query("#meeting-category-select")
+            category_focused = bool(category) and category.first().has_focus_within
+            return title_input.has_focus or notes_input.has_focus or category_focused
         except Exception:
             return False
 
@@ -165,6 +183,8 @@ class MeetingListItem(ListItem):
             title_line = [l for l in content.split('\n') if l.startswith('title:')]
             word_count_line = [l for l in content.split('\n') if l.startswith('word_count:')]
             tags_line = [l for l in content.split('\n') if l.startswith('tags:')]
+            category_line = [l for l in content.split('\n') if l.startswith('category:')]
+            self.category = category_line[0].split(':', 1)[1].strip().strip('"') if category_line else ''
             
             self.date = date_line[0].split(':', 1)[1].strip() if date_line else 'Unknown'
             self.time = time_line[0].split(':', 1)[1].strip().strip('"') if time_line else 'Unknown'
@@ -189,10 +209,15 @@ class MeetingListItem(ListItem):
             self.full_title = note_path.stem
             self.word_count = '0'
             self.tags = []
+            self.category = ''
         
         # Build label with tags if present
         tags_display = f" [{', '.join(self.tags)}]" if self.tags else ""
-        label_text = f"{self.title}{tags_display}\n[dim]{self.date} {self.time} · {self.word_count} words[/dim]"
+        category_display = f"{escape(self.category)} · " if self.category else ""
+        label_text = (
+            f"{self.title}{tags_display}\n"
+            f"[dim]{category_display}{self.date} {self.time} · {self.word_count} words[/dim]"
+        )
         super().__init__(Label(label_text))
     
     def matches_search(self, query: str) -> bool:
@@ -207,6 +232,7 @@ class MeetingListItem(ListItem):
             query in self.full_title.lower() or
             query in self.date.lower() or
             query in self.time.lower() or
+            query in self.category.lower() or
             any(query in tag.lower() for tag in self.tags)
         )
 
@@ -282,6 +308,7 @@ class NoteViewer(ScrollableContainer):
             f"# {job.label}",
             "",
             f"**Status:** {job.status} · stage: {job.stage} · attempts: {job.attempts}/{jobs.MAX_ATTEMPTS}",
+            f"**Category:** {job.category or library.UNCATEGORISED}",
             f"**Stopped:** {job.stopped_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Audio:** `{job.audio_path}` ({size})",
         ]
@@ -399,6 +426,71 @@ class ManageTagsScreen(ModalScreen[list]):
             self.dismiss(tags)
         else:
             self.dismiss([])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CategoryPickerScreen(ModalScreen[str]):
+    """Pick a category to refile a meeting under. Dismisses with the name,
+    "" for uncategorised, or None when cancelled."""
+
+    CSS = """
+    CategoryPickerScreen {
+        align: center middle;
+    }
+
+    #category-dialog {
+        width: 80%;
+        max-width: 50;
+        height: auto;
+        border: solid $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #category-title {
+        text-align: center;
+        margin-bottom: 1;
+    }
+
+    #category-dialog Button {
+        width: 100%;
+        margin: 0;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, categories: list, current: Optional[str], **kwargs):
+        super().__init__(**kwargs)
+        self.categories = list(categories)
+        self.current = current or ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="category-dialog"):
+            yield Static("Move meeting to…", id="category-title")
+            for index, name in enumerate(self.categories + [""]):
+                label = name or library.UNCATEGORISED
+                is_current = name == self.current
+                button = Button(
+                    f"{'●' if is_current else '○'} {label}",
+                    id=f"category-{index}",
+                    variant="primary" if is_current else "default",
+                )
+                button.category_name = name
+                yield button
+
+    def on_mount(self) -> None:
+        buttons = list(self.query(Button))
+        target = next((b for b in buttons if b.category_name == self.current), buttons[0] if buttons else None)
+        if target is not None:
+            target.focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        name = getattr(event.button, "category_name", None)
+        if name is not None:
+            self.dismiss(name)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -602,20 +694,22 @@ class ConfirmDeleteScreen(ModalScreen):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
     
-    def __init__(self, meeting_title: str, message: Optional[str] = None,
+    def __init__(self, meeting_title: str, with_audio: bool = False, message: Optional[str] = None,
                  heading: str = "⚠️  Delete Meeting?", **kwargs):
         super().__init__(**kwargs)
         self.meeting_title = meeting_title
+        self.with_audio = with_audio
         self.message = message
         self.heading = heading
     
     def compose(self) -> ComposeResult:
+        removed = "note, transcript and audio" if self.with_audio else "note and transcript"
         with Container(id="confirm-dialog"):
             yield Static(self.heading, id="confirm-title")
             yield Static(
                 self.message or
                 f'Are you sure you want to delete:\n"{self.meeting_title}"?\n\n'
-                "The meeting note and transcript will be removed. This cannot be undone.",
+                f"The meeting {removed} will be removed. This cannot be undone.",
                 id="confirm-message",
             )
             with Horizontal(id="confirm-buttons"):
@@ -816,6 +910,16 @@ class OmascribeApp(App):
         margin: 0 0 2 0;
     }
     
+    #category-label {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #meeting-category-select {
+        width: 100%;
+        margin: 0 0 2 0;
+    }
+
     #notes-label {
         color: $text-muted;
         margin-bottom: 1;
@@ -876,6 +980,7 @@ class OmascribeApp(App):
         Binding("e", "edit_title", "Edit Title", show=True),
         Binding("t", "view_transcript", "Transcript", show=True),
         Binding("T", "manage_tags", "Tags", show=True),
+        Binding("m", "move_meeting", "Move", show=True),
         Binding("R", "retry_job", "Retry", show=False),
         Binding("comma", "open_settings", "Settings", show=True),
         Binding("A", "audio_test", "Audio Test", show=True),
@@ -988,7 +1093,7 @@ class OmascribeApp(App):
 
         self.load_meetings()
         
-
+        # Initialize recorder with config
         logger.info(f"Initializing audio recorder (mode: {self.config.recording_mode})")
         self.recorder = AudioRecorder(
             output_dir=self.config.recordings_dir,
@@ -1050,11 +1155,7 @@ class OmascribeApp(App):
     
     def load_meetings(self):
         """Load meeting notes from disk."""
-        notes = sorted(
-            self.notes_dir.glob("*.md"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True
-        )
+        notes = library.list_notes(self.config)
         
         # Store all note paths
         self.all_note_paths = list(notes)
@@ -1124,6 +1225,7 @@ class OmascribeApp(App):
             ai_provider=config.ai_provider,
             ai_model=config.ai_model,
             api_key=config.provider_api_key(),
+            meetings_dir=config.meetings_dir,
         )
 
     def _from_runner(self, callback, *args) -> None:
@@ -1232,8 +1334,10 @@ class OmascribeApp(App):
         elif self.is_recording and action in {
             "open_in_editor", "copy_to_clipboard", "copy_path", "show_in_folder",
             "delete_meeting", "edit_title", "view_transcript", "manage_tags",
-            "open_settings", "quit",
+            "open_settings", "quit", "move_meeting",
         }:
+            return False
+        elif action == "move_meeting" and not library.uses_folders(self.config):
             return False
         return True  # All other actions always available
 
@@ -1561,7 +1665,7 @@ class OmascribeApp(App):
                 # Now swap UI to recording view
                 main_panels = self.query_one("#main-panels", Container)
                 main_panels.display = False
-                recording_view = RecordingView()
+                recording_view = RecordingView(categories=self.config.categories)
                 self.mount(recording_view)
 
                 self._write_desktop_status("recording", duration="00:00")
@@ -1703,6 +1807,14 @@ class OmascribeApp(App):
                         logger.info(f"User notes captured: {len(user_notes)} characters")
                 except Exception:
                     pass  # No title input found
+                category = None
+                try:
+                    select = self.query_one("#meeting-category-select", Select)
+                    if isinstance(select.value, str):
+                        category = select.value
+                        logger.info(f"Meeting category: {category}")
+                except Exception:
+                    pass  # No categories configured
                 
                 # Stop timer + level meter + routing refresh
                 if self.timer_interval:
@@ -1754,7 +1866,7 @@ class OmascribeApp(App):
 
                 # Persist the work before anything can fail: from here the job
                 # file, not this process, owns turning the audio into a note.
-                job = jobs.enqueue(audio_path, title=meeting_title,
+                job = jobs.enqueue(audio_path, title=meeting_title, category=category,
                                    user_notes=user_notes, stopped_at=datetime.now())
                 
                 # Remove recording view
@@ -2059,7 +2171,7 @@ class OmascribeApp(App):
             
             # Show confirmation modal
             self.push_screen(
-                ConfirmDeleteScreen(title),
+                ConfirmDeleteScreen(title, with_audio=library.uses_folders(self.config)),
                 self.handle_delete_confirmation
             )
         else:
@@ -2071,41 +2183,8 @@ class OmascribeApp(App):
             viewer = self.query_one("#note-viewer", NoteViewer)
             if viewer.current_note:
                 try:
-                    note_path = Path(viewer.current_note)
-                    transcript_path = None
-                    content = note_path.read_text(encoding="utf-8")
-                    if content.startswith("---"):
-                        parts = content.split("---", 2)
-                        if len(parts) >= 2:
-                            for line in parts[1].splitlines():
-                                if line.strip().startswith("transcript_file:"):
-                                    filename = line.split(":", 1)[1].strip().strip('"')
-                                    base = Path(self.config.transcripts_dir).expanduser().resolve()
-                                    candidate = (base / filename).resolve()
-                                    if candidate.is_relative_to(base):
-                                        transcript_path = candidate
-                                    break
-
-                    staged_note = note_path.with_name(f".{note_path.name}.deleting-{os.getpid()}")
-                    staged_transcript = None
-                    note_path.replace(staged_note)
-                    try:
-                        if transcript_path and transcript_path.exists():
-                            staged_transcript = transcript_path.with_name(
-                                f".{transcript_path.name}.deleting-{os.getpid()}"
-                            )
-                            transcript_path.replace(staged_transcript)
-                    except Exception:
-                        staged_note.replace(note_path)
-                        raise
-
-                    for staged in (staged_note, staged_transcript):
-                        if staged is not None:
-                            try:
-                                staged.unlink()
-                            except OSError:
-                                logger.warning(f"Could not purge staged deleted file: {staged}")
-                    self.notify("✓ Deleted meeting and transcript", severity="information")
+                    library.delete_meeting(Path(viewer.current_note), self.config)
+                    self.notify("✓ Deleted meeting", severity="information")
                     
                     # Clear viewer
                     viewer.show_empty()
@@ -2257,6 +2336,44 @@ class OmascribeApp(App):
                 except Exception as e:
                     self.notify(f"Failed to update tags: {e}", severity="error")
     
+    def action_move_meeting(self) -> None:
+        """Refile the selected meeting under another category."""
+        viewer = self.query_one("#note-viewer", NoteViewer)
+        if not viewer.current_note:
+            self.notify("No note selected", severity="warning")
+            return
+        current = library.category_of(Path(viewer.current_note), self.config)
+        self.push_screen(
+            CategoryPickerScreen(self.config.categories, current),
+            self.handle_move_meeting,
+        )
+
+    def handle_move_meeting(self, choice: Optional[str]) -> None:
+        """Apply a category picked in CategoryPickerScreen ("" = uncategorised)."""
+        if choice is None:
+            return
+        viewer = self.query_one("#note-viewer", NoteViewer)
+        if not viewer.current_note:
+            return
+        category = choice or None
+        try:
+            new_note = library.move_meeting(Path(viewer.current_note), category, self.config)
+        except Exception as e:
+            logger.error(f"Failed to move meeting: {e}", exc_info=True)
+            self.notify(f"Failed to move meeting: {e}", severity="error")
+            return
+        self.notify(f"✓ Moved to {library.category_dir_name(category)}", severity="information")
+        self.load_meetings()
+        viewer.show_note(new_note)
+        try:
+            meeting_list = self.query_one("#meetings", ListView)
+            for index, item in enumerate(meeting_list.children):
+                if isinstance(item, MeetingListItem) and item.note_path == new_note:
+                    meeting_list.index = index
+                    break
+        except Exception:
+            pass
+
     def action_view_transcript(self) -> None:
         """View transcript for the selected meeting."""
         viewer = self.query_one("#note-viewer", NoteViewer)
@@ -2268,30 +2385,13 @@ class OmascribeApp(App):
                 self.notify("Note file no longer exists", severity="warning")
                 return
             try:
-                # Read note to get transcript_file from frontmatter
-                with open(viewer.current_note, 'r') as f:
-                    content = f.read()
-                
-                # Parse transcript_file from frontmatter
-                transcript_filename = None
-                if content.startswith('---'):
-                    parts = content.split('---', 2)
-                    if len(parts) >= 2:
-                        frontmatter = parts[1]
-                        for line in frontmatter.split('\n'):
-                            if line.strip().startswith('transcript_file:'):
-                                transcript_filename = line.split(':', 1)[1].strip().strip('"')
-                                break
-                
-                if transcript_filename:
-                    transcript_path = Path(self.config.transcripts_dir).expanduser() / transcript_filename
-                    
-                    if transcript_path.exists():
-                        self.push_screen(TranscriptViewer(transcript_path))
-                    else:
-                        self.notify(f"Transcript not found: {transcript_filename}", severity="error")
-                else:
+                transcript_path = library.transcript_path_for(Path(viewer.current_note), self.config)
+                if transcript_path is None:
                     self.notify("This note doesn't have a separate transcript file", severity="warning")
+                elif transcript_path.exists():
+                    self.push_screen(TranscriptViewer(transcript_path))
+                else:
+                    self.notify(f"Transcript not found: {transcript_path.name}", severity="error")
                     
             except Exception as e:
                 logger.error(f"Error viewing transcript: {e}", exc_info=True)
@@ -2343,7 +2443,10 @@ class OmascribeApp(App):
         The transcriber and note maker are built per job by the JobRunner (see
         _make_note_maker), so a Settings change applies to the next job.
         """
-        self.notes_dir = Path(self.config.notes_dir).expanduser()
+        if library.uses_folders(self.config):
+            self.notes_dir = library.meetings_root(self.config)
+        else:
+            self.notes_dir = Path(self.config.notes_dir).expanduser()
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
     def handle_settings_closed(self, new_config: Optional[AppConfig]) -> None:

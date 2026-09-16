@@ -271,3 +271,68 @@ async def test_recording_is_not_blocked_by_a_busy_queue(tmp_path, monkeypatch):
             assert app.check_action(action, ()) is True, action
         app.job_runner.current = None
         app.exit()
+
+
+def _folder_layout_config(tmp_path, monkeypatch, categories):
+    from omascribe.config import AppConfig, save_config
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    # validate_config rejects a non-default recordings_dir that doesn't exist,
+    # and a rejected config silently drops the app into safe defaults.
+    (tmp_path / "rec").mkdir()
+    cfg = AppConfig(meetings_dir=str(tmp_path / "Meetings"), recordings_dir=str(tmp_path / "rec"),
+                    categories=categories)
+    save_config(cfg)
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_recording_view_offers_categories_only_when_configured():
+    from textual.app import App
+    from textual.widgets import Select
+
+    class Host(App):
+        def __init__(self, categories):
+            super().__init__()
+            self.categories = categories
+
+        def compose(self):
+            yield RecordingView(categories=self.categories)
+
+    for categories, expected in ((["Personal", "DGxC Customer"], 1), ([], 0)):
+        app = Host(categories)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert len(app.query(Select)) == expected
+            app.exit()
+
+
+@pytest.mark.asyncio
+async def test_move_meeting_refiles_and_refreshes(tmp_path, monkeypatch):
+    from omascribe import library
+    from omascribe.app import CategoryPickerScreen
+    from omascribe.note_maker import NoteMaker
+
+    cfg = _folder_layout_config(tmp_path, monkeypatch, ["Personal", "DGxC Customer"])
+    NoteMaker(ai_provider="none", meetings_dir=cfg.meetings_dir).create_note(
+        transcript_text="hi", formatted_transcript="hi", duration=1, title="Standup")
+
+    app = OmascribeApp()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        [note] = library.list_notes(cfg)
+        app.query_one("#note-viewer", NoteViewer).show_note(note)
+        await pilot.press("m")
+        await pilot.pause()
+        assert isinstance(app.screen, CategoryPickerScreen)
+        [button] = [b for b in app.screen.query("Button") if b.category_name == "DGxC Customer"]
+        button.press()
+        await pilot.pause()
+        [moved] = library.list_notes(cfg)
+        assert moved.parent.parent.name == "DGxC Customer"
+        assert app.query_one("#note-viewer", NoteViewer).current_note == moved
+        items = [i for i in app.query_one("#meetings", ListView).children if hasattr(i, "category")]
+        assert items[0].category == "DGxC Customer"
+        app.exit()
+

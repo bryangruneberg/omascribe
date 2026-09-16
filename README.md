@@ -50,6 +50,7 @@ omascribe
 | `T` | Manage tags |
 | `d` | Delete (discard, on a queued job) |
 | `R` | Retry a queued or failed job |
+| `m` | Move a meeting to another category (folder layout) |
 | `,` | Settings |
 | `A` | Audio test |
 | `q` | Quit |
@@ -155,6 +156,30 @@ tags: [meeting, auto-generated]
 ```
 
 Full transcripts with timestamps are saved separately in `transcripts/`.
+
+### Categories and one folder per meeting (optional)
+
+Set `meetings_dir` and a list of `categories` to keep each meeting's note,
+transcript and audio together, grouped by category:
+
+```yaml
+meetings_dir: ~/Documents/Meetings
+categories: [Work, Clients, Personal]
+```
+
+```
+~/Documents/Meetings/<Category>/<YYYY-MM-DD-HHMMSS-title>/<same>.md   note
+                                                         <same>.txt  transcript
+                                                         <same>.wav  audio
+~/Documents/Meetings/Uncategorised/...                               no category
+```
+
+A **Category** dropdown appears under the meeting title while recording; the
+category is shown and searchable in the meetings list and given to the AI as
+context. `m` moves a saved meeting to another category. With `meetings_dir`
+empty (the default) the flat `notes/` + `transcripts/` layout is unchanged.
+`omascribe-migrate-folders` moves existing flat notes (dry run by default,
+`--apply` to act), matching recordings by timestamp.
 
 ## Audio
 
