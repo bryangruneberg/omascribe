@@ -129,6 +129,12 @@ def bar_status() -> int:
     except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, ProcessLookupError):
         pass
 
+    failed = _job_summary()["jobs"]["failed"]
+    if failed:
+        result["text"] = f"{result['text']} 󰀦 {failed}"
+        result["tooltip"] = f"{failed} transcription{'s' if failed != 1 else ''} failed — open Omascribe to retry"
+        result["class"] = "failed"
+
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 
@@ -150,6 +156,27 @@ def _frontmatter_value(text: str, key: str) -> str:
         if line.startswith(f"{key}:"):
             return line.split(":", 1)[1].strip().strip('"')
     return ""
+
+
+def _job_summary() -> dict:
+    """Queue counts and failed recordings, read from disk so they show while the TUI is closed."""
+    from . import jobs
+
+    try:
+        queue = jobs.list_jobs()
+    except OSError:
+        return {"jobs": {"queued": 0, "running": 0, "failed": 0}, "failed_jobs": []}
+    counts = {"queued": 0, "running": 0, "failed": 0}
+    for job in queue:
+        key = {"pending": "queued"}.get(job.status, job.status)
+        if key in counts:
+            counts[key] += 1
+    failed = [
+        {"title": job.label, "error": (job.last_error or "").splitlines()[0][:160] if job.last_error else ""}
+        for job in queue
+        if job.status == "failed"
+    ][:5]
+    return {"jobs": counts, "failed_jobs": failed}
 
 
 def panel_data() -> int:
@@ -187,6 +214,7 @@ def panel_data() -> int:
 
     result = {
         "status": status,
+        **_job_summary(),
         "notes_dir": str(notes_dir),
         "config_path": str(config.get_config_path()),
         "recent": recent,

@@ -28,27 +28,52 @@ Panel {
   readonly property string state: info && info.status && info.status.state ? String(info.status.state) : "ready"
   readonly property string duration: info && info.status ? String(info.status.duration || "") : ""
   readonly property var recent: info && info.recent ? info.recent : []
+  // Processing queue, read from disk by omascribe-panel -- so a failed
+  // transcription shows here even while the TUI is closed.
+  readonly property int failedCount: info && info.jobs ? Number(info.jobs.failed || 0) : 0
+  readonly property int queuedCount: info && info.jobs ? Number(info.jobs.queued || 0) + Number(info.jobs.running || 0) : 0
+  readonly property var failedJobs: info && info.failed_jobs ? info.failed_jobs : []
   readonly property int refreshInterval: Math.max(1, root.setting("refreshIntervalSec", 1))
   readonly property int maxRecent: Math.max(0, root.setting("maxRecent", 6))
 
   readonly property string stateLabel: {
+    var base
     switch (root.state) {
-      case "recording": return "RECORDING"
-      case "processing": return "PROCESSING"
-      default: return "READY"
+      case "recording": base = "RECORDING"; break
+      case "processing": base = "PROCESSING"; break
+      default: base = root.queuedCount > 0 ? root.queuedCount + " QUEUED" : "READY"
     }
+    return root.failedCount > 0 ? base + " · " + root.failedCount + " FAILED" : base
   }
 
-  function barText() {
-    if (root.state === "recording") return "󰦕 " + root.duration
-    if (root.state === "processing") return "󰄬"
+  // The bar button is a BarIconButton: a fixed one-glyph slot that cannot
+  // show "icon + count". A failure therefore replaces the glyph and turns the
+  // button the bar's urgent colour; the count is in the tooltip and the panel.
+  function barGlyph() {
+    if (root.state === "recording") return "󰦕"
+    if (root.failedCount > 0) return "󰀦"
+    if (root.state === "processing" || root.queuedCount > 0) return "󰄬"
     return "󰗠"
   }
 
+  function barText() {
+    var text
+    if (root.state === "recording") text = "󰦕 " + root.duration
+    else if (root.state === "processing" || root.queuedCount > 0) text = "󰄬" + (root.queuedCount > 1 ? " " + root.queuedCount : "")
+    else text = "󰗠"
+    if (root.failedCount > 0) text += " 󰀦 " + root.failedCount
+    return text
+  }
+
   function barTooltip() {
-    if (root.state === "recording") return "Omascribe — recording " + root.duration
-    if (root.state === "processing") return "Omascribe — processing recording"
-    return "Omascribe — ready"
+    var text
+    if (root.state === "recording") text = "Omascribe — recording " + root.duration
+    else if (root.state === "processing") text = "Omascribe — processing recording"
+    else if (root.queuedCount > 0) text = "Omascribe — " + root.queuedCount + " recording(s) queued"
+    else text = "Omascribe — ready"
+    if (root.failedCount > 0)
+      text += "\n" + root.failedCount + " transcription" + (root.failedCount === 1 ? "" : "s") + " failed — open to retry"
+    return text
   }
 
   function applyData(raw) {
@@ -179,7 +204,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barText()
+    text: root.barGlyph()
+    active: root.failedCount > 0 && root.state !== "recording"
     tooltipText: root.barTooltip()
     onPressed: function(b) {
       if (b === Qt.RightButton) root.launchTui()
@@ -314,6 +340,41 @@ Panel {
               label: "Settings"
               meta: "edit config.yaml"
               onActivated: root.openSettings()
+            }
+          }
+
+          // ---- Failed transcriptions ----
+          PanelSeparator {
+            visible: root.failedJobs.length > 0
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.failedJobs.length > 0
+
+            PanelSectionHeader {
+              text: "FAILED — OPEN TO RETRY"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Repeater {
+              model: root.failedJobs
+
+              ActionRow {
+                required property var modelData
+                required property int index
+                width: panelColumn.width
+                // Outside the keyboard cursor's range: these are click targets
+                // that all do the same thing, open the TUI where R retries.
+                rowIndex: 100 + index
+                glyph: "󰀦"
+                label: String(modelData.title || "Recording")
+                meta: String(modelData.error || "")
+                onActivated: root.launchTui()
+              }
             }
           }
 

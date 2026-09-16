@@ -48,7 +48,8 @@ omascribe
 | `e` | Edit title |
 | `t` | View transcript |
 | `T` | Manage tags |
-| `d` | Delete |
+| `d` | Delete (discard, on a queued job) |
+| `R` | Retry a queued or failed job |
 | `,` | Settings |
 | `A` | Audio test |
 | `q` | Quit |
@@ -57,6 +58,25 @@ omascribe
 | `1` / `2` | Focus Meetings / Note pane |
 
 During recording, write notes in the text area — they're fed to the AI as extra context.
+
+### Processing queue
+
+Stopping a recording queues it and returns immediately — you can start the
+next meeting while the last one is still uploading. Queued jobs live in
+`~/.local/state/omascribe/jobs/` and survive failures and restarts:
+
+- network errors, timeouts and HTTP 408/429/5xx retry with backoff (1, 5, 15,
+  then 60 minutes; 5 attempts); anything else fails straight away;
+- a cloud transcription resumes from its saved transcript id instead of
+  uploading again, and a finished transcript is cached so writing the note
+  can be retried on its own;
+- closing the app mid-job is safe — the job resumes on next launch.
+
+Queued and failed recordings appear at the top of the meetings list.
+Select one and press `R` to retry now, or `d` to discard the job (the audio
+file is always kept). A job that gives up sends a desktop notification, and
+the Omarchy bar widget shows a warning glyph with the failures listed in its
+panel, even while the TUI is closed.
 
 ## AI Setup
 
