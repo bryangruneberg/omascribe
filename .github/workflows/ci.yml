@@ -73,4 +73,5 @@ jobs:
             tests/test_desktop_integration.py \
             tests/test_logging_security.py \
             tests/test_textual_smoke.py \
-            tests/test_assemblyai.py
+            tests/test_assemblyai.py \
+            tests/test_jobs.py

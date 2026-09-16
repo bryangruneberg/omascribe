@@ -19,6 +19,9 @@ from textual.screen import Screen, ModalScreen
 from textual import work
 
 from omascribe.recorder import AudioRecorder, list_active_sink_inputs
+from rich.markup import escape
+
+from omascribe import jobs
 from omascribe.transcriber import build_transcriber, format_segments
 from omascribe.note_maker import NoteMaker
 from omascribe.config import load_config, save_config, AppConfig, validate_config
@@ -208,6 +211,35 @@ class MeetingListItem(ListItem):
         )
 
 
+class JobListItem(ListItem):
+    """A recording still in the processing queue, or one that failed."""
+
+    STAGE_LABEL = {"transcribe": "transcribing", "note": "writing note"}
+
+    def __init__(self, job: "jobs.Job"):
+        self.job = job
+        title = escape(job.label)
+        stage = self.STAGE_LABEL.get(job.stage, job.stage)
+        category = f"{escape(job.category)} · " if job.category else ""
+        if job.status == "failed":
+            reason = escape((job.last_error or "unknown error").splitlines()[0][:70])
+            label = f"[b red]✗ {title}[/b red]\n[red]{category}{stage} failed · {reason}[/red]"
+        elif job.status == "running":
+            label = f"[yellow]󰄬 {title}[/yellow]\n[dim]{category}{stage}…[/dim]"
+        else:
+            if job.attempts:
+                when = datetime.fromtimestamp(job.next_attempt_at).strftime("%H:%M")
+                detail = f"retry {when} (attempt {job.attempts + 1}/{jobs.MAX_ATTEMPTS})"
+            else:
+                detail = "queued"
+            label = f"[yellow]󰔟 {title}[/yellow]\n[dim]{category}{stage} · {detail}[/dim]"
+        super().__init__(Label(label))
+
+    def matches_search(self, query: str) -> bool:
+        query = query.lower()
+        return not query or query in self.job.label.lower() or query in (self.job.category or "").lower()
+
+
 class NoteViewer(ScrollableContainer):
     """Display selected meeting note content."""
     
@@ -241,6 +273,28 @@ class NoteViewer(ScrollableContainer):
             self.remove_children()
             self.mount(Static(f"[red]Error loading note:[/red] {e}"))
     
+    def show_job(self, job: "jobs.Job"):
+        """Show a queued or failed recording instead of a note."""
+        self.current_note = None
+        audio = Path(job.audio_path)
+        size = f"{audio.stat().st_size / (1024 * 1024):.1f} MB" if audio.exists() else "missing"
+        lines = [
+            f"# {job.label}",
+            "",
+            f"**Status:** {job.status} · stage: {job.stage} · attempts: {job.attempts}/{jobs.MAX_ATTEMPTS}",
+            f"**Stopped:** {job.stopped_at.strftime('%Y-%m-%d %H:%M')}",
+            f"**Audio:** `{job.audio_path}` ({size})",
+        ]
+        if job.transcript_id:
+            lines.append(f"**AssemblyAI transcript:** `{job.transcript_id}` (a retry resumes it, no re-upload)")
+        if job.status == "pending" and job.next_attempt_at:
+            lines.append(f"**Next attempt:** {datetime.fromtimestamp(job.next_attempt_at).strftime('%H:%M:%S')}")
+        if job.last_error:
+            lines += ["", "## Last error", "", "```", job.last_error, "```"]
+        lines += ["", "---", "", "*R* retry now · *d* discard (the audio file is kept)"]
+        self.remove_children()
+        self.mount(Markdown("\n".join(lines)))
+
     def show_empty(self):
         """Show empty state."""
         self.remove_children()
@@ -548,14 +602,18 @@ class ConfirmDeleteScreen(ModalScreen):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
     
-    def __init__(self, meeting_title: str, **kwargs):
+    def __init__(self, meeting_title: str, message: Optional[str] = None,
+                 heading: str = "⚠️  Delete Meeting?", **kwargs):
         super().__init__(**kwargs)
         self.meeting_title = meeting_title
+        self.message = message
+        self.heading = heading
     
     def compose(self) -> ComposeResult:
         with Container(id="confirm-dialog"):
-            yield Static("⚠️  Delete Meeting?", id="confirm-title")
+            yield Static(self.heading, id="confirm-title")
             yield Static(
+                self.message or
                 f'Are you sure you want to delete:\n"{self.meeting_title}"?\n\n'
                 "The meeting note and transcript will be removed. This cannot be undone.",
                 id="confirm-message",
@@ -818,6 +876,7 @@ class OmascribeApp(App):
         Binding("e", "edit_title", "Edit Title", show=True),
         Binding("t", "view_transcript", "Transcript", show=True),
         Binding("T", "manage_tags", "Tags", show=True),
+        Binding("R", "retry_job", "Retry", show=False),
         Binding("comma", "open_settings", "Settings", show=True),
         Binding("A", "audio_test", "Audio Test", show=True),
         Binding("slash", "focus_search", "Search", show=True),
@@ -915,9 +974,21 @@ class OmascribeApp(App):
         note_panel = self.query_one("#note-panel", Vertical)
         note_panel.border_title = "[2] Note"
 
+        # Processing queue: stopped recordings become job files, worked by one
+        # background thread that survives failures and app restarts.
+        self.job_runner = jobs.JobRunner(
+            config_provider=lambda: self.config,
+            build_transcriber=build_transcriber,
+            build_note_maker=self._make_note_maker,
+            on_change=lambda job: self._from_runner(self._on_job_change, job),
+            on_done=lambda job, note, err: self._from_runner(self._on_job_done, job, note, err),
+            on_gave_up=lambda job: self._from_runner(self._on_job_gave_up, job),
+        )
+        self.job_runner.start()
+
         self.load_meetings()
         
-        # Initialize recorder with config
+
         logger.info(f"Initializing audio recorder (mode: {self.config.recording_mode})")
         self.recorder = AudioRecorder(
             output_dir=self.config.recordings_dir,
@@ -927,7 +998,8 @@ class OmascribeApp(App):
             system_device=self.config.system_device or None,
         )
         
-        self._write_desktop_status("ready")
+        self._publish_idle_status()
+        self._on_job_change(None)
         
         # Show empty state
         viewer = self.query_one("#note-viewer", NoteViewer)
@@ -945,6 +1017,10 @@ class OmascribeApp(App):
     
     def on_unmount(self) -> None:
         """Cleanup when app exits."""
+        # A job interrupted here resumes from its checkpoint on next launch.
+        runner = getattr(self, "job_runner", None)
+        if runner is not None:
+            runner.stop()
         # Kill any active recording to clean up processes. We use
         # cancel_recording rather than stop_recording so we don't leave a
         # background ffmpeg mix running after the TUI is gone.
@@ -994,9 +1070,16 @@ class OmascribeApp(App):
             return  # ListView not mounted yet
         
         meeting_list.clear()
+
+        # Queued and failed recordings first: a failure must not scroll away.
+        for job in jobs.list_jobs():
+            item = JobListItem(job)
+            if item.matches_search(query):
+                meeting_list.append(item)
         
         if not self.all_note_paths:
-            meeting_list.append(ListItem(Label("[dim]No meetings yet\nPress 'r' to record[/dim]")))
+            if not meeting_list.children:
+                meeting_list.append(ListItem(Label("[dim]No meetings yet\nPress 'r' to record[/dim]")))
             return
         
         # Filter meetings by query - create fresh MeetingListItem for each check
@@ -1016,19 +1099,118 @@ class OmascribeApp(App):
     
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle meeting selection."""
-        if isinstance(event.item, MeetingListItem):
+        if isinstance(event.item, JobListItem):
+            self.query_one("#note-viewer", NoteViewer).show_job(event.item.job)
+        elif isinstance(event.item, MeetingListItem):
             viewer = self.query_one("#note-viewer", NoteViewer)
             viewer.show_note(event.item.note_path)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Keep the preview synchronized with keyboard navigation."""
-        if isinstance(event.item, MeetingListItem):
+        if isinstance(event.item, JobListItem):
+            self.query_one("#note-viewer", NoteViewer).show_job(event.item.job)
+        elif isinstance(event.item, MeetingListItem):
             self.query_one("#note-viewer", NoteViewer).show_note(event.item.note_path)
     
     def on_input_changed(self, event: Input.Changed) -> None:
         """Handle search input changes."""
         if event.input.id == "search-input":
             self.filter_meetings(event.value)
+
+    def _make_note_maker(self, config: AppConfig) -> NoteMaker:
+        return NoteMaker(
+            output_dir=config.notes_dir,
+            transcripts_dir=config.transcripts_dir,
+            ai_provider=config.ai_provider,
+            ai_model=config.ai_model,
+            api_key=config.provider_api_key(),
+        )
+
+    def _from_runner(self, callback, *args) -> None:
+        """Run a job-runner callback on the UI thread (ignored once shutting down)."""
+        try:
+            self.call_from_thread(callback, *args)
+        except RuntimeError:
+            pass
+
+    def _publish_idle_status(self) -> None:
+        """Desktop status when not recording: processing while the queue is busy."""
+        if self.is_recording:
+            return
+        runner = getattr(self, "job_runner", None)
+        self._write_desktop_status("processing" if runner is not None and runner.busy else "ready")
+
+    def _on_job_change(self, job: Optional["jobs.Job"]) -> None:
+        runner = getattr(self, "job_runner", None)
+        self.is_processing = bool(runner and runner.busy)
+        waiting = [j for j in jobs.list_jobs() if j.status == "pending"]
+        failed = [j for j in jobs.list_jobs() if j.status == "failed"]
+        current = runner.current if runner else None
+        parts = []
+        if current is not None:
+            doing = "Writing note for" if current.stage == "note" else "Transcribing"
+            parts.append(f"󰄬  {doing} {escape(current.label)}")
+        if waiting:
+            parts.append(f"{len(waiting)} queued")
+        if failed:
+            parts.append(f"[red]{len(failed)} failed — select it and press R to retry[/red]")
+        try:
+            self._set_processing_stage(" · ".join(parts))
+        except Exception:
+            pass
+        self._publish_idle_status()
+        self.load_meetings()
+        self.refresh_bindings()
+
+    def _on_job_done(self, job: "jobs.Job", note_path: str, ai_error: Optional[str]) -> None:
+        if ai_error:
+            self.notify(f"⚠ Note created for {job.label}, but {ai_error}", severity="warning", timeout=15)
+            notify_desktop(f"Note saved for {job.label}, but AI summarization failed.", urgency="critical")
+        else:
+            self.notify(f"✓ Note created: {job.label}", severity="information")
+            notify_desktop(f"{job.label}: note and transcript are ready.", glyph="󰈙")
+        self.load_meetings()
+
+    def _on_job_gave_up(self, job: "jobs.Job") -> None:
+        reason = (job.last_error or "unknown error").splitlines()[0][:160]
+        self.notify(f"✗ {job.label} failed: {reason}. Select it and press R to retry.",
+                    severity="error", timeout=30)
+        notify_desktop(
+            f"Transcription of {job.label} failed: {reason}. Open omascribe to retry.",
+            urgency="critical",
+        )
+
+    def _selected_job(self) -> Optional["jobs.Job"]:
+        try:
+            item = self.query_one("#meetings", ListView).highlighted_child
+        except Exception:
+            return None
+        return item.job if isinstance(item, JobListItem) else None
+
+    def action_retry_job(self) -> None:
+        job = self._selected_job()
+        if job is None:
+            self.notify("Select a queued or failed recording to retry", severity="warning")
+            return
+        jobs.retry_now(job.id)
+        self.job_runner.wake()
+        self.notify(f"Retrying {job.label}", severity="information")
+        self._on_job_change(None)
+
+    def handle_discard_job(self, confirmed: Optional[bool], job_id: str = "") -> None:
+        if confirmed is not True:
+            return
+        job = jobs.get(job_id)
+        if job is None:
+            return
+        runner = getattr(self, "job_runner", None)
+        if runner is not None and runner.current is not None and runner.current.id == job.id:
+            self.notify("That recording is being processed right now; try again when it stops", severity="warning")
+            return
+        jobs.delete(job)
+        self.notify(f"Discarded {job.label}; audio kept at {job.audio_path}", severity="information", timeout=15)
+        self.query_one("#note-viewer", NoteViewer).show_empty()
+        self._on_job_change(None)
 
     def _write_desktop_status(self, state: str, duration: str = "") -> None:
         """Publish optional desktop state without affecting recording."""
@@ -1040,20 +1222,18 @@ class OmascribeApp(App):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Control which actions are available based on recording state."""
         if action == "start_recording":
-            return not self.is_recording and not self.is_processing
+            return not self.is_recording
         elif action in ["stop_recording", "cancel_recording"]:
             return self.is_recording
         elif action == "audio_test":
             # Hide from the footer while recording — running the test mid-meeting
             # would fight the recorder for the same source.
-            return not self.is_recording and not self.is_processing
+            return not self.is_recording
         elif self.is_recording and action in {
             "open_in_editor", "copy_to_clipboard", "copy_path", "show_in_folder",
             "delete_meeting", "edit_title", "view_transcript", "manage_tags",
             "open_settings", "quit",
         }:
-            return False
-        elif self.is_processing and action in {"open_settings", "quit"}:
             return False
         return True  # All other actions always available
 
@@ -1357,9 +1537,6 @@ class OmascribeApp(App):
 
     def action_start_recording(self) -> None:
         """Start recording and switch to full-screen recording view."""
-        if self.is_processing:
-            self.notify("Wait for the current recording to finish processing", severity="warning")
-            return
         logger.info(
             f"action_start_recording: mode={self.config.recording_mode}, "
             f"mic_device={self.config.mic_device!r}, "
@@ -1437,7 +1614,7 @@ class OmascribeApp(App):
                         logger.exception("Failed to clean up recorder after UI startup error")
                 self.notify(f"Failed to start recording: {e}", severity="error")
                 self.is_recording = False
-                self._write_desktop_status("ready")
+                self._publish_idle_status()
                 notify_desktop("Recording could not start. Open the app for details.", urgency="critical")
                 # Restore main panels if something failed
                 try:
@@ -1478,7 +1655,7 @@ class OmascribeApp(App):
             self.recording_start_time = None
             logger.info("Recording cancelled successfully")
             
-            self._write_desktop_status("ready")
+            self._publish_idle_status()
             
             # Remove recording view
             try:
@@ -1501,7 +1678,7 @@ class OmascribeApp(App):
         except Exception as e:
             logger.error(f"Failed to cancel recording: {e}", exc_info=True)
             self.notify(f"Failed to cancel recording: {e}", severity="error")
-            self._write_desktop_status("ready")
+            self._publish_idle_status()
             notify_desktop("Recording could not be cancelled cleanly. Open the app for details.", urgency="critical")
     
     def action_stop_recording(self) -> None:
@@ -1575,9 +1752,10 @@ class OmascribeApp(App):
                         f"Preserved temp files for manual recovery: {preserved}"
                     )
 
-                self.is_processing = True
-                self._write_desktop_status("processing")
-                self._set_processing_stage("󰄬  Preparing transcription…")
+                # Persist the work before anything can fail: from here the job
+                # file, not this process, owns turning the audio into a note.
+                job = jobs.enqueue(audio_path, title=meeting_title,
+                                   user_notes=user_notes, stopped_at=datetime.now())
                 
                 # Remove recording view
                 try:
@@ -1594,9 +1772,10 @@ class OmascribeApp(App):
                 self.refresh_bindings()
                 
                 # Process in background
-                self.notify("Processing recording...", severity="information")
-                notify_desktop("Recording stopped. Transcription is processing.", glyph="󰄬")
-                self.process_recording(audio_path, meeting_title, user_notes)
+                self.notify("Recording queued for transcription", severity="information")
+                notify_desktop(f"{job.label}: recording stopped, transcription queued.", glyph="󰄬")
+                self.job_runner.wake()
+                self._on_job_change(None)
                 
             except Exception as e:
                 logger.error(f"Failed to stop recording: {e}", exc_info=True)
@@ -1610,7 +1789,7 @@ class OmascribeApp(App):
                 self.is_recording = False
                 self.is_processing = False
                 self.recording_start_time = None
-                self._write_desktop_status("ready")
+                self._publish_idle_status()
                 try:
                     self.query_one(RecordingView).remove()
                 except Exception:
@@ -1621,72 +1800,6 @@ class OmascribeApp(App):
                     pass
                 self.refresh_bindings()
                 notify_desktop("Recording could not be stopped. Open the app for details.", urgency="critical")
-    
-    @work(exclusive=True, thread=True)
-    def process_recording(self, audio_path: str, meeting_title: Optional[str] = None, user_notes: str = "") -> None:
-        """Process recording in background thread."""
-        logger.info(f"Processing recording: {audio_path}")
-        try:
-            engine = self.transcriber.describe()
-            if self.config.transcriber == "whisper":
-                # Load Whisper model (if not already loaded)
-                logger.info("Loading Whisper model")
-                self.call_from_thread(self._set_processing_stage, f"󰄬  Loading {engine}…")
-                self.call_from_thread(self.notify, f"Loading {engine} model...", severity="information")
-                self.transcriber.load_model()
-            
-            # Transcribe
-            logger.info(f"Starting transcription ({engine})")
-            self.call_from_thread(self._set_processing_stage, f"󰄬  Transcribing audio with {engine}…")
-            self.call_from_thread(self.notify, f"Transcribing audio with {engine} (this may take a few minutes)...", severity="information")
-            result = self.transcriber.transcribe(audio_path)
-            
-            word_count = len(result.text.split())
-            logger.info(f"Transcription complete: {word_count} words")
-            self.call_from_thread(self.notify, f"✓ Transcribed {word_count} words. Generating AI summary...", severity="information")
-            
-            # Format transcript
-            formatted = format_segments(result.segments)
-            
-            # Generate note with AI summary (pass custom title if provided)
-            logger.info("Creating note with AI summary")
-            self.call_from_thread(self._set_processing_stage, "󰄬  Generating meeting note…")
-            duration = result.duration or (result.segments[-1].end if result.segments else 0)
-            note_path, transcript_path, ai_error = self.note_maker.create_note(
-                transcript_text=result.text,
-                formatted_transcript=formatted,
-                duration=duration,
-                title=meeting_title,
-                user_notes=user_notes,
-                summary_input=result.speaker_text(),
-            )
-            
-            # Update UI
-            if ai_error:
-                logger.warning(f"Note created but AI summarization failed: {ai_error}")
-                self.call_from_thread(self.notify, f"⚠ Note created but {ai_error}", severity="warning")
-                self.call_from_thread(self.notify, f"Check ~/.config/omascribe/errors.log for details", severity="warning")
-                notify_desktop("Note saved, but AI summarization failed. Click to inspect it.", urgency="critical")
-            else:
-                logger.info(f"Note created successfully: {note_path}")
-                logger.info(f"Transcript saved: {transcript_path}")
-                self.call_from_thread(self.notify, f"✓ Note created: {Path(note_path).name}", severity="information")
-                notify_desktop("Your note and transcript are ready.", glyph="󰈙")
-            self.call_from_thread(self.load_meetings)
-            
-        except Exception as e:
-            logger.error(f"Error processing recording: {e}", exc_info=True)
-            self.call_from_thread(self.notify, f"Error processing: {e}", severity="error")
-            notify_desktop("Processing failed. Click to open the app and check the private log.", urgency="critical")
-            
-        finally:
-            self._write_desktop_status("ready")
-            self.is_processing = False
-            try:
-                self.call_from_thread(self._set_processing_stage, "")
-                self.call_from_thread(self.refresh_bindings)
-            except Exception:
-                pass
     
     def _open_in_new_terminal(self, editor: str, file_path: str) -> bool:
         """
@@ -1917,6 +2030,20 @@ class OmascribeApp(App):
     
     def action_delete_meeting(self) -> None:
         """Delete the selected meeting after confirmation."""
+        job = self._selected_job()
+        if job is not None:
+            self.push_screen(
+                ConfirmDeleteScreen(
+                    job.label,
+                    heading="Discard queued recording?",
+                    message=(
+                        f'Stop processing "{job.label}"?\n\n'
+                        f"The job is removed; the audio file is kept at:\n{job.audio_path}"
+                    ),
+                ),
+                lambda confirmed, job_id=job.id: self.handle_discard_job(confirmed, job_id),
+            )
+            return
         viewer = self.query_one("#note-viewer", NoteViewer)
         if viewer.current_note:
             # Get the meeting item to show its title
@@ -2188,8 +2315,8 @@ class OmascribeApp(App):
     
     def action_open_settings(self) -> None:
         """Open the settings screen."""
-        if self.is_recording or self.is_processing:
-            self.notify("Settings are unavailable while recording or processing", severity="warning")
+        if self.is_recording:
+            self.notify("Settings are unavailable while recording", severity="warning")
             return
         self.push_screen(SettingsScreen(self.config), self.handle_settings_closed)
 
@@ -2199,7 +2326,7 @@ class OmascribeApp(App):
         Disabled while a real recording is in flight so the test capture
         can't fight the meeting capture for the same source.
         """
-        if self.is_recording or self.is_processing:
+        if self.is_recording:
             self.notify("Stop the current recording before running the audio test.",
                         severity="warning")
             return
@@ -2211,15 +2338,11 @@ class OmascribeApp(App):
         banner.display = bool(message)
     
     def _build_pipeline(self) -> None:
-        """(Re)build transcriber and note maker from the current config."""
-        self.transcriber = build_transcriber(self.config)
-        self.note_maker = NoteMaker(
-            output_dir=self.config.notes_dir,
-            transcripts_dir=self.config.transcripts_dir,
-            ai_provider=self.config.ai_provider,
-            ai_model=self.config.ai_model,
-            api_key=self.config.provider_api_key(),
-        )
+        """Resolve where notes live for the current config.
+
+        The transcriber and note maker are built per job by the JobRunner (see
+        _make_note_maker), so a Settings change applies to the next job.
+        """
         self.notes_dir = Path(self.config.notes_dir).expanduser()
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 

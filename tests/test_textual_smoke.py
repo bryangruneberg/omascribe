@@ -196,3 +196,78 @@ async def test_assemblyai_provider_and_transcriber_switching(tmp_path, monkeypat
         assert screen.config["ai_model"] == "sonnet"
         app.exit()
 
+
+def _app_config(tmp_path, monkeypatch, **fields):
+    from omascribe.config import AppConfig, save_config
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    # validate_config rejects a non-default recordings_dir that doesn't exist,
+    # and a rejected config silently drops the app into safe defaults.
+    (tmp_path / "rec").mkdir()
+    cfg = AppConfig(recordings_dir=str(tmp_path / "rec"), **fields)
+    save_config(cfg)
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_failed_job_row_retry_and_discard(tmp_path, monkeypatch):
+    from omascribe import jobs
+    from omascribe.app import JobListItem
+
+    _app_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    audio = tmp_path / "rec" / "2026-09-16-083001.wav"
+    audio.write_bytes(b"RIFF")
+    job = jobs.enqueue(str(audio), title="Midweek Mayhem")
+    job.status, job.attempts, job.last_error = "failed", 5, "SSLError: UNEXPECTED_EOF_WHILE_READING"
+    jobs.save(job)
+    # The runner would pick the job up again after R; keep it inert here.
+    monkeypatch.setattr(jobs.JobRunner, "start", lambda self: False)
+
+    app = OmascribeApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        meetings = app.query_one("#meetings", ListView)
+        first = meetings.children[0]
+        assert isinstance(first, JobListItem) and first.job.status == "failed"
+        assert "failed" in str(first.query_one("Label").render())
+
+        meetings.focus()
+        meetings.index = 0
+        await pilot.pause()
+        assert app.query_one("#note-viewer", NoteViewer).current_note is None
+        assert app.check_action("start_recording", ()) is True
+
+        await pilot.press("R")
+        await pilot.pause()
+        assert jobs.get(job.id).status == "pending" and jobs.get(job.id).attempts == 0
+
+        meetings.index = 0
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        app.screen.query_one("#delete-button").press()
+        await pilot.pause()
+        assert jobs.get(job.id) is None
+        assert audio.exists(), "discarding a job never deletes the audio"
+        app.exit()
+
+
+@pytest.mark.asyncio
+async def test_recording_is_not_blocked_by_a_busy_queue(tmp_path, monkeypatch):
+    from omascribe import jobs
+    _app_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(jobs.JobRunner, "start", lambda self: False)
+    app = OmascribeApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.job_runner.current = jobs.Job(id="x", audio_path="/tmp/x.wav", status="running")
+        app._on_job_change(None)
+        await pilot.pause()
+        assert app.is_processing
+        for action in ("start_recording", "audio_test", "open_settings", "quit"):
+            assert app.check_action(action, ()) is True, action
+        app.job_runner.current = None
+        app.exit()

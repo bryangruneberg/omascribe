@@ -123,6 +123,7 @@ class NoteMaker:
         metadata: Optional[dict] = None,
         user_notes: str = "",
         summary_input: Optional[str] = None,
+        when: Optional[datetime] = None,
     ) -> tuple[str, str, Optional[str]]:
         """Create a markdown note and separate transcript file.
         
@@ -136,11 +137,14 @@ class NoteMaker:
             summary_input: What the summariser reads, when it should differ
                 from transcript_text (e.g. with speaker labels). Word counts
                 still come from transcript_text.
+            when: The meeting's time (default now). Names the files, so
+                repeating a call for the same meeting overwrites rather than
+                duplicates -- which is what makes a retried job idempotent.
             
         Returns:
             Tuple of (note_path, transcript_path, error_message). error_message is None if no error occurred.
         """
-        now = datetime.now()
+        now = when or datetime.now()
         
         if title is None:
             title = f"Meeting {now.strftime('%Y-%m-%d %H:%M')}"
